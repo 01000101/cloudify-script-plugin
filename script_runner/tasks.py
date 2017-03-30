@@ -23,19 +23,24 @@ import threading
 from StringIO import StringIO
 import tempfile
 
+# For process handling
+import psutil
+
 import requests
 
 from cloudify import ctx as operation_ctx
 from cloudify.workflows import ctx as workflows_ctx
 from cloudify.decorators import operation, workflow
 from cloudify.exceptions import NonRecoverableError
-
-from script_runner import eval_env
+from cloudify.manager import get_rest_client
 from cloudify.proxy.client import CTX_SOCKET_URL
 from cloudify.proxy.server import (UnixCtxProxy,
                                    TCPCtxProxy,
                                    HTTPCtxProxy,
                                    StubCtxProxy)
+from script_runner import eval_env
+from cloudify_rest_client.exceptions import CloudifyClientError
+from cloudify_rest_client.executions import Execution
 
 try:
     import zmq  # noqa
@@ -44,6 +49,12 @@ except ImportError:
     HAS_ZMQ = False
 
 IS_WINDOWS = os.name == 'nt'
+
+DEFAULT_POLL_INTERVAL = 0.1
+DEFAULT_CANCEL_POLL_INTERVAL = 100
+
+# pylint: disable=W0212
+# pylint: disable=C0111
 
 
 @operation
@@ -71,11 +82,11 @@ def create_process_config(process, operation_kwargs):
     if 'ctx' in env_vars:
         del env_vars['ctx']
     env_vars.update(process.get('env', {}))
-    for k, v in env_vars.items():
-        if isinstance(v, (dict, list, set, bool)):
-            env_vars[k] = json.dumps(v)
+    for key, val in env_vars.items():
+        if isinstance(val, (dict, list, set, bool)):
+            env_vars[key] = json.dumps(val)
         else:
-            env_vars[k] = str(v)
+            env_vars[key] = str(val)
     process['env'] = env_vars
     return process
 
@@ -98,6 +109,95 @@ def get_run_script_func(script_path, process):
         return execute
 
 
+def cancellation_requested(ctx, rest_client):
+    '''
+        Checks if a task cancellation was requested by the user.
+
+    :param `cloudify.context.CloudifyContext` ctx:
+        Current Cloudify context.
+    :param `cloudify_rest_client.CloudifyClient` rest_client:
+        A Cloudify REST API client.
+    :returns: False on REST error, None if no cancellation was request,
+        or the execution status if a cancellation was requested.
+    '''
+    # Check the REST API for the execution status
+    ctx.logger.debug(
+        'Checking if the user requested an execution cancellation')
+    try:
+        execution_status = rest_client.executions.get(
+            ctx.execution_id, _include=['status']).status
+    except CloudifyClientError as exc:
+        ctx.logger.warning(
+            'Failed to get status of execution %s: %s'
+            % (ctx.execution_id, str(exc)))
+        return False
+    # If the user hasn't request any cancellations, continue
+    ctx.logger.debug('Execution status: %s' % execution_status)
+    # Sometimes Cloudify prematurely marks the execution as "cancelled"
+    # and in this case we still need to kill processes and confirm.
+    if execution_status not in [Execution.CANCELLED,
+                                Execution.CANCELLING,
+                                Execution.FORCE_CANCELLING]:
+        return None
+    ctx.logger.info('User requested a task cancellation (%s)'
+                    % execution_status)
+    return execution_status
+
+
+def handle_cancellations(ctx, process, rest_client, force_kill=False):
+    '''
+        Handles task cancellations by the user.
+
+    :param `cloudify.context.CloudifyContext` ctx:
+        Current Cloudify context.
+    :param `psutil.Process` process:
+        Process of the script executor.
+    :param `cloudify_rest_client.CloudifyClient` rest_client:
+        A Cloudify REST API client.
+    :param Boolean force_kill:
+        If True, uses SIGKILL signal on processes. SIGTERM otherwise.
+    :returns: True if all offending processes have been terminated,
+        False if some are still pending.
+    '''
+    def process_terminated_callback(proc):
+        '''
+            Terminated process callback.
+
+        .. info:
+            This is a somewhat global callback and will report
+            process terminations not invoked by this script.
+        '''
+        ctx.logger.info('Process terminated: %s' % proc)
+    # Check if the current process is still running
+    if not process.is_running():
+        ctx.logger.info('Parent process (%s) has been killed' % process.pid)
+        return True
+    # Check if any children processes are (still) running
+    _, palive = psutil.wait_procs(
+        process.children(recursive=True), timeout=1,
+        callback=process_terminated_callback)
+    # If no processes are left, terminate the current process
+    if not palive:
+        ctx.logger.info('All child processes have been terminated')
+        ctx.logger.info('Attempting to terminate (%s) parent process %s' % (
+            'SIGKILL' if force_kill else 'SIGTERM', process.pid))
+        if force_kill:
+            process.kill()
+        else:
+            process.terminate()
+        return False
+    ctx.logger.info('%s child process(es) still alive' % len(palive))
+    # If some processes are (still) running, send a followup signal
+    for proc in palive:
+        ctx.logger.info('Attempting to terminate (%s) child process %s' % (
+            'SIGKILL' if force_kill else 'SIGTERM', proc.pid))
+        if force_kill:
+            proc.kill()
+        else:
+            proc.terminate()
+    return False
+
+
 def execute(script_path, ctx, process):
     on_posix = 'posix' in sys.builtin_module_names
 
@@ -109,6 +209,9 @@ def execute(script_path, ctx, process):
     env[CTX_SOCKET_URL] = proxy.socket_url
 
     cwd = process.get('cwd')
+    poll_interval = process.get('poll_interval', DEFAULT_POLL_INTERVAL)
+    cancel_poll_interval = process.get('cancel_poll_interval',
+                                       DEFAULT_CANCEL_POLL_INTERVAL)
 
     command_prefix = process.get('command_prefix')
     if command_prefix:
@@ -130,18 +233,45 @@ def execute(script_path, ctx, process):
                                cwd=cwd,
                                bufsize=1,
                                close_fds=on_posix)
+    pprocess = psutil.Process(process.pid).parent()
 
     return_code = None
 
     stdout_consumer = OutputConsumer(process.stdout)
     stderr_consumer = OutputConsumer(process.stderr)
 
+    # Get an interface to the REST API
+    rest_client = get_rest_client()
+    poll_counter = 0
+    cold_blooded = False
+
     while True:
+        poll_counter += 1
         process_ctx_request(proxy)
-        return_code = process.poll()
-        if return_code is not None:
+        # If the parent process has finished, so have we
+        if not pprocess.is_running():
+            # Return the exit code of the script invoker process
+            return_code = process.returncode
+            ctx.logger.info('Process has exited (code=%s)'
+                            % return_code)
             break
-        time.sleep(0.1)
+        # Handle task cancellation requests
+        if (poll_counter % cancel_poll_interval) == 0:
+            # Check if the user requested a cancellation
+            exec_status = cancellation_requested(ctx, rest_client)
+            if exec_status:
+                # Use SIGKILL if this is a force_cancellation request
+                if exec_status == Execution.FORCE_CANCELLING:
+                    cold_blooded = True
+                if handle_cancellations(ctx, pprocess, rest_client,
+                                        force_kill=cold_blooded):
+                    # If we're here, then all processes (including the
+                    # parent process) are killed
+                    break
+                # Regardless of cancel type, send SIGKILL on followup attempts
+                cold_blooded = True
+        # ZZzzz
+        time.sleep(poll_interval)
 
     proxy.close()
     stdout_consumer.join()
@@ -161,10 +291,7 @@ def start_ctx_proxy(ctx, process):
     ctx_proxy_type = process.get('ctx_proxy_type')
     if not ctx_proxy_type or ctx_proxy_type == 'auto':
         if HAS_ZMQ:
-            if IS_WINDOWS:
-                return TCPCtxProxy(ctx)
-            else:
-                return UnixCtxProxy(ctx)
+            return TCPCtxProxy(ctx) if IS_WINDOWS else UnixCtxProxy(ctx)
         else:
             return HTTPCtxProxy(ctx)
     elif ctx_proxy_type == 'unix':
@@ -206,8 +333,8 @@ def download_resource(download_resource_func, script_path):
         content = response.text
         suffix = script_path.split('/')[-1]
         script_path = tempfile.mktemp(suffix='-{0}'.format(suffix))
-        with open(script_path, 'w') as f:
-            f.write(content)
+        with open(script_path, 'w') as fscript:
+            fscript.write(content)
         return script_path
     else:
         return download_resource_func(script_path)
